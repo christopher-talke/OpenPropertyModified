@@ -126,28 +126,28 @@ function buildUpdate(fields: Record<string, unknown>): { sets: string[]; params:
   for (const [k, v] of Object.entries(fields)) {
     if (v !== undefined) { sets.push(`${k} = ?`); params.push(v); }
   }
-
-  const isoNow = () => new Date().toISOString();
-
-  const parseDateToMs = (value: string | null | undefined): number => {
-    if (!value) return Date.now();
-    const parsed = Date.parse(value);
-    return Number.isNaN(parsed) ? Date.now() : parsed;
-  };
-
-  function extractJsonObject(raw: string): string | null {
-    const start = raw.indexOf("{");
-    if (start < 0) return null;
-    let depth = 0;
-    for (let i = start; i < raw.length; i++) {
-      const ch = raw[i];
-      if (ch === "{") depth++;
-      if (ch === "}") depth--;
-      if (depth === 0) return raw.slice(start, i + 1);
-    }
-    return null;
-  }
   return { sets, params };
+}
+
+const isoNow = () => new Date().toISOString();
+
+const parseDateToMs = (value: string | null | undefined): number => {
+  if (!value) return Date.now();
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? Date.now() : parsed;
+};
+
+function extractJsonObject(raw: string): string | null {
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === "{") depth++;
+    if (ch === "}") depth--;
+    if (depth === 0) return raw.slice(start, i + 1);
+  }
+  return null;
 }
 
 // ── Properties ─────────────────────────────────────────────────────
