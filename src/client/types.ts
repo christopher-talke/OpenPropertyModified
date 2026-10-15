@@ -136,7 +136,7 @@ export interface Vendor {
 }
 
 export type WorkOrderPriority = "low" | "normal" | "high" | "urgent";
-export type WorkOrderStatus = "open" | "assigned" | "in_progress" | "completed" | "cancelled";
+export type WorkOrderStatus = "open" | "assigned" | "in_progress" | "pending_owner_decision" | "completed" | "cancelled";
 
 export interface WorkOrder {
   id: number;
@@ -161,6 +161,40 @@ export interface WorkOrder {
   tenant_last_name?: string | null;
   vendor_name?: string | null;
   vendor_color?: string | null;
+}
+
+export type TimelineType = "note" | "email" | "system_activity";
+
+export interface TicketTimelineItem {
+  id: number;
+  ticket_id: number;
+  type: TimelineType;
+  sender_contact_id: number | null;
+  message_body: string;
+  timestamp: string;
+  sender_name?: string | null;
+  sender_email_address?: string | null;
+  sender_company_name?: string | null;
+}
+
+export type PaymentSource = "Rental Income Deduction" | "Owner Contribution";
+
+export interface Expense {
+  id: number;
+  property_id: number;
+  work_order_id: number;
+  amount_owed: number;
+  amount_paid: number;
+  date_paid: string | null;
+  payment_source: PaymentSource | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExpenseSummary {
+  owner_capital_injected: number;
+  total_amount_owed: number;
+  total_amount_paid: number;
 }
 
 export type ApplicationStatus = "new" | "screening" | "approved" | "declined" | "withdrawn";
@@ -217,3 +251,11 @@ export type NewLease = Partial<Omit<Lease, "id" | "created_at" | "unit_name" | "
 export type NewWorkOrder = Partial<Omit<WorkOrder, "id" | "created_at" | "property_name" | "property_color" | "unit_name" | "tenant_first_name" | "tenant_last_name" | "vendor_name" | "vendor_color">> & { title: string };
 export type NewVendor = Partial<Omit<Vendor, "id" | "created_at">> & { name: string };
 export type NewApplication = Partial<Omit<Application, "id" | "created_at" | "unit_name" | "property_name">> & { first_name: string; last_name: string };
+export type NewTimelineItem = {
+  type?: TimelineType;
+  sender_contact_id?: number | null;
+  message_body: string;
+  timestamp?: string;
+};
+export type NewExpense = Pick<Expense, "property_id" | "amount_owed"> &
+  Partial<Pick<Expense, "amount_paid" | "date_paid" | "payment_source">>;

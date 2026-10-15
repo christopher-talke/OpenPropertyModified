@@ -8,11 +8,16 @@ import type {
   RentCharge,
   Vendor,
   WorkOrder,
+  TicketTimelineItem,
+  Expense,
+  ExpenseSummary,
   NewProperty,
   NewUnit,
   NewTenant,
   NewLease,
   NewWorkOrder,
+  NewTimelineItem,
+  NewExpense,
   NewVendor,
 } from "../types";
 
@@ -250,6 +255,43 @@ export function useAppState() {
     await api("DELETE", `/api/work-orders/${id}`);
   }, []);
 
+  const listTicketTimeline = useCallback(async (workOrderId: number): Promise<TicketTimelineItem[]> => {
+    const res = await api<{ timeline: TicketTimelineItem[] }>("GET", `/api/work-orders/${workOrderId}/timeline`);
+    return res.timeline;
+  }, []);
+
+  const createTicketTimelineItem = useCallback(async (workOrderId: number, data: NewTimelineItem) => {
+    const res = await api<{ timeline_item: TicketTimelineItem }>("POST", `/api/work-orders/${workOrderId}/timeline`, data);
+    return res.timeline_item;
+  }, []);
+
+  const listExpensesForWorkOrder = useCallback(async (workOrderId: number): Promise<Expense[]> => {
+    const res = await api<{ expenses: Expense[] }>("GET", `/api/work-orders/${workOrderId}/expenses`);
+    return res.expenses;
+  }, []);
+
+  const createExpenseForWorkOrder = useCallback(async (workOrderId: number, data: NewExpense) => {
+    const res = await api<{ expense: Expense }>("POST", `/api/work-orders/${workOrderId}/expenses`, data);
+    return res.expense;
+  }, []);
+
+  const deleteExpense = useCallback(async (expenseId: number) => {
+    await api("DELETE", `/api/expenses/${expenseId}`);
+  }, []);
+
+  const getExpenseSummary = useCallback(async (): Promise<ExpenseSummary> => {
+    return api<ExpenseSummary>("GET", "/api/expenses/summary");
+  }, []);
+
+  const mergeWorkOrders = useCallback(async (source_ticket_id: number, destination_ticket_id: number) => {
+    const res = await api<{ work_order: WorkOrder; merged_from: number; merged_into: number }>(
+      "POST",
+      "/api/work-orders/merge",
+      { source_ticket_id, destination_ticket_id },
+    );
+    return res;
+  }, []);
+
   return {
     // data
     properties, vendors, settings,
@@ -270,7 +312,9 @@ export function useAppState() {
     // vendors
     createVendor, updateVendor, deleteVendor,
     // work orders
-    listWorkOrders, createWorkOrder, updateWorkOrder, deleteWorkOrder,
+    listWorkOrders, createWorkOrder, updateWorkOrder, deleteWorkOrder, mergeWorkOrders,
+    listTicketTimeline, createTicketTimelineItem,
+    listExpensesForWorkOrder, createExpenseForWorkOrder, deleteExpense, getExpenseSummary,
   };
 }
 
