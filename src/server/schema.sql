@@ -126,6 +126,15 @@ CREATE TABLE IF NOT EXISTS vendors (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- ── Contacts (email/system actors) ─────────────────────────────────
+CREATE TABLE IF NOT EXISTS contacts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT,
+  email_address TEXT NOT NULL UNIQUE,
+  company_name TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ── Work orders (maintenance) ────────────────────────────────────
 CREATE TABLE IF NOT EXISTS work_orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,6 +156,35 @@ CREATE TABLE IF NOT EXISTS work_orders (
 CREATE INDEX IF NOT EXISTS idx_wo_status ON work_orders(status);
 CREATE INDEX IF NOT EXISTS idx_wo_property ON work_orders(property_id);
 CREATE INDEX IF NOT EXISTS idx_wo_unit ON work_orders(unit_id);
+
+-- ── Ticket timeline (notes + email + system activity) ─────────────
+CREATE TABLE IF NOT EXISTS ticket_timeline (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id INTEGER NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
+  type TEXT NOT NULL CHECK (type IN ('note', 'email', 'system_activity')),
+  sender_contact_id INTEGER REFERENCES contacts(id) ON DELETE SET NULL,
+  message_body TEXT NOT NULL,
+  timestamp TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_timeline_ticket ON ticket_timeline(ticket_id);
+CREATE INDEX IF NOT EXISTS idx_timeline_time ON ticket_timeline(timestamp);
+
+-- ── Expenses (per property/work-order) ────────────────────────────
+CREATE TABLE IF NOT EXISTS expenses (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+  work_order_id INTEGER NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
+  amount_owed REAL NOT NULL DEFAULT 0,
+  amount_paid REAL NOT NULL DEFAULT 0,
+  date_paid TEXT,
+  payment_source TEXT CHECK (payment_source IN ('Rental Income Deduction', 'Owner Contribution')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_expenses_work_order ON expenses(work_order_id);
+CREATE INDEX IF NOT EXISTS idx_expenses_property ON expenses(property_id);
 
 -- ── Applications (manual record only — no public submission) ─────
 CREATE TABLE IF NOT EXISTS applications (

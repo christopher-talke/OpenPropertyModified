@@ -21,6 +21,7 @@ const STATUS_VARIANT: Record<string, "default" | "secondary" | "outline" | "dest
   open: "secondary",
   assigned: "default",
   in_progress: "default",
+  pending_owner_decision: "destructive",
   completed: "outline",
   cancelled: "outline",
 };
@@ -32,12 +33,17 @@ export function MaintenancePage() {
   const [filter, setFilter] = useState<WorkOrderStatus | "open_all" | "all">("open_all");
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editing, setEditing] = useState<WorkOrder | undefined>(undefined);
+  const [ownerCapitalInjected, setOwnerCapitalInjected] = useState(0);
 
   async function load() {
     try {
       setLoading(true);
-      const list = await app.listWorkOrders();
+      const [list, expenseSummary] = await Promise.all([
+        app.listWorkOrders(),
+        app.getExpenseSummary().catch(() => ({ owner_capital_injected: 0, total_amount_owed: 0, total_amount_paid: 0 })),
+      ]);
       setOrders(list);
+      setOwnerCapitalInjected(expenseSummary.owner_capital_injected);
     } catch (err) {
       app.setError((err as Error).message);
     } finally {
@@ -91,10 +97,15 @@ export function MaintenancePage() {
             <TabsTrigger value="open">Unassigned</TabsTrigger>
             <TabsTrigger value="assigned">Assigned</TabsTrigger>
             <TabsTrigger value="in_progress">In progress</TabsTrigger>
+            <TabsTrigger value="pending_owner_decision">Pending owner</TabsTrigger>
             <TabsTrigger value="completed">Completed</TabsTrigger>
             <TabsTrigger value="all">All</TabsTrigger>
           </TabsList>
         </Tabs>
+        <Card className="p-4 text-sm">
+          <p className="text-muted-foreground">Owner Capital Injected</p>
+          <p className="mt-1 text-lg font-semibold">{formatMoney(ownerCapitalInjected, app.settings.currency)}</p>
+        </Card>
 
         {loading ? (
           <Card className="p-8 text-center text-sm text-muted-foreground">Loading…</Card>
@@ -136,7 +147,7 @@ export function MaintenancePage() {
                 )}
                 <div className="mt-3 flex items-center justify-between border-t pt-3 text-xs">
                   <div className="flex items-center gap-2">
-                    <Badge variant={STATUS_VARIANT[w.status] ?? "secondary"} className="capitalize">{w.status.replace("_", " ")}</Badge>
+                    <Badge variant={STATUS_VARIANT[w.status] ?? "secondary"} className="capitalize">{w.status.replaceAll("_", " ")}</Badge>
                     {w.vendor_name && <span className="text-muted-foreground">{w.vendor_name}</span>}
                   </div>
                   <div className="text-right text-muted-foreground">

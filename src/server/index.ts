@@ -2,7 +2,11 @@ import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { initDB, query, get, run } from "./db";
 
-type Env = { Bindings: { DB: D1Database } };
+type WorkersAI = {
+  run: (model: string, input: unknown) => Promise<unknown>;
+};
+
+type Env = { Bindings: { DB: D1Database; AI?: WorkersAI; AI_COMPANY_NAME?: string } };
 
 const app = new Hono<Env>();
 
@@ -24,6 +28,10 @@ const DEFAULT_SETTINGS: Record<string, string> = {
   late_fee_grace_days: "5",
   currency: "USD",
 };
+
+const ACTIVE_WORK_ORDER_STATUSES = ["open", "assigned", "in_progress", "pending_owner_decision"] as const;
+const TIMELINE_TYPES = ["note", "email", "system_activity"] as const;
+const PAYMENT_SOURCES = ["Rental Income Deduction", "Owner Contribution"] as const;
 
 const DEMO_PROPERTIES: Array<[string, string, string, string, string, string, string]> = [
   ["Oakwood Estate", "single_family", "210 Oakwood Ln", "Austin", "TX", "78704", "emerald"],
@@ -119,6 +127,27 @@ function buildUpdate(fields: Record<string, unknown>): { sets: string[]; params:
     if (v !== undefined) { sets.push(`${k} = ?`); params.push(v); }
   }
   return { sets, params };
+}
+
+const isoNow = () => new Date().toISOString();
+
+const parseDateToMs = (value: string | null | undefined): number => {
+  if (!value) return Date.now();
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? Date.now() : parsed;
+};
+
+function extractJsonObject(raw: string): string | null {
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (ch === "{") depth++;
+    if (ch === "}") depth--;
+    if (depth === 0) return raw.slice(start, i + 1);
+  }
+  return null;
 }
 
 // ── Properties ─────────────────────────────────────────────────────
@@ -666,11 +695,48 @@ const WorkOrderInput = z.object({
   title: z.string().min(1),
   description: z.string().optional().nullable(),
   priority: z.enum(["low", "normal", "high", "urgent"]).optional(),
-  status: z.enum(["open", "assigned", "in_progress", "completed", "cancelled"]).optional(),
+  status: z.enum(["open", "assigned", "in_progress", "pending_owner_decision", "completed", "cancelled"]).optional(),
   scheduled_at: z.string().optional().nullable(),
   completed_at: z.string().optional().nullable(),
   cost: z.number().min(0).optional().nullable(),
   notes: z.string().optional().nullable(),
+});
+
+const TicketTimelineInput = z.object({
+  type: z.enum(TIMELINE_TYPES).default("note"),
+  sender_contact_id: z.number().int().nullable().optional(),
+  message_body: z.string().min(1),
+  timestamp: z.string().optional(),
+});
+
+const ExpenseInput = z.object({
+  property_id: z.number().int(),
+  amount_owed: z.number().min(0),
+  amount_paid: z.number().min(0).optional().default(0),
+  date_paid: z.string().nullable().optional(),
+  payment_source: z.enum(PAYMENT_SOURCES).nullable().optional(),
+});
+
+const MergeTicketInput = z.object({
+  source_ticket_id: z.number().int().positive(),
+  destination_ticket_id: z.number().int().positive(),
+});
+
+const EmailIngestInput = z.object({
+  sender_email: z.string().email().optional(),
+  sender_name: z.string().optional().nullable(),
+  from_email: z.string().email().optional(),
+  from_name: z.string().optional().nullable(),
+  subject: z.string().optional().nullable(),
+  body_text: z.string().optional().nullable(),
+  body: z.string().optional().nullable(),
+}).superRefine((value, ctx) => {
+  if (!(value.sender_email ?? value.from_email)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "sender_email or from_email is required" });
+  }
+  if (!(value.body_text ?? value.body)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "body_text or body is required" });
+  }
 });
 
 const WO_SELECT = `
@@ -685,6 +751,77 @@ const WO_SELECT = `
   LEFT JOIN tenants t ON t.id = w.tenant_id
   LEFT JOIN vendors v ON v.id = w.vendor_id
 `;
+
+type TicketDecision = { action: "append"; ticket_id: number; reason: string } | { action: "create_new"; suggested_title: string; reason: string };
+
+function normalizeDecision(
+  parsed: unknown,
+  activeIds: number[],
+  fallbackTitle: string,
+): TicketDecision {
+  if (!parsed || typeof parsed !== "object") {
+    return { action: "create_new", suggested_title: fallbackTitle, reason: "AI output was not a JSON object." };
+  }
+
+  const action = (parsed as { action?: unknown }).action;
+  if (action === "append") {
+    const rawId = (parsed as { ticket_id?: unknown }).ticket_id;
+    const ticketId = Number(rawId);
+    const reason = String((parsed as { reason?: unknown }).reason ?? "Matched by AI classifier.");
+    if (Number.isInteger(ticketId) && activeIds.includes(ticketId)) {
+      return { action: "append", ticket_id: ticketId, reason };
+    }
+  }
+
+  const suggestedTitle = String((parsed as { suggested_title?: unknown }).suggested_title ?? fallbackTitle).trim() || fallbackTitle;
+  const reason = String((parsed as { reason?: unknown }).reason ?? "No confident match to active tickets.");
+  return { action: "create_new", suggested_title: suggestedTitle, reason };
+}
+
+async function classifyEmailToTicket(
+  ai: WorkersAI | undefined,
+  payload: { subject: string; bodyText: string; activeTickets: Array<{ id: number; title: string; description: string | null; status: string }> },
+): Promise<TicketDecision> {
+  const fallbackTitle = payload.subject.trim() || "Auto-created ticket from email";
+  const activeIds = payload.activeTickets.map((ticket) => ticket.id);
+  if (!activeIds.length) return { action: "create_new", suggested_title: fallbackTitle, reason: "No active work orders found." };
+  if (!ai) return { action: "create_new", suggested_title: fallbackTitle, reason: "Workers AI binding unavailable; created new ticket." };
+
+  const systemPrompt = `You match incoming maintenance emails to active work orders.
+Return only strict JSON with one of:
+{"action":"append","ticket_id":number,"reason":"string"}
+{"action":"create_new","suggested_title":"string","reason":"string"}
+Only use a ticket_id from the provided active work orders.`;
+
+  const userPrompt = JSON.stringify({
+    email: { subject: payload.subject, body: payload.bodyText },
+    active_work_orders: payload.activeTickets,
+  });
+
+  try {
+    const result = await ai.run("@cf/meta/llama-3-8b-instruct", {
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      max_tokens: 300,
+      temperature: 0.1,
+    });
+
+    const response =
+      typeof result === "string"
+        ? result
+        : typeof (result as { response?: unknown }).response === "string"
+          ? String((result as { response?: unknown }).response)
+          : "";
+
+    const json = extractJsonObject(response);
+    if (!json) return { action: "create_new", suggested_title: fallbackTitle, reason: "AI response did not contain JSON." };
+    return normalizeDecision(JSON.parse(json), activeIds, fallbackTitle);
+  } catch {
+    return { action: "create_new", suggested_title: fallbackTitle, reason: "Workers AI classification failed." };
+  }
+}
 
 app.get("/api/work-orders", async (c) => {
   const status = c.req.query("status");
@@ -719,6 +856,57 @@ app.post("/api/work-orders", async (c) => {
   return c.json({ work_order: row }, 201);
 });
 
+app.post("/api/work-orders/merge", async (c) => {
+  const parsed = await parseJson(c, MergeTicketInput);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const { source_ticket_id: sourceId, destination_ticket_id: destinationId } = parsed.data;
+  if (sourceId === destinationId) return c.json({ error: "Source and destination must differ" }, 400);
+
+  const [source, destination] = await Promise.all([
+    get<{ id: number; title: string }>("SELECT id, title FROM work_orders WHERE id = ?", [sourceId]),
+    get<{ id: number; title: string }>("SELECT id, title FROM work_orders WHERE id = ?", [destinationId]),
+  ]);
+  if (!source || !destination) return c.json({ error: "One or both tickets were not found" }, 404);
+
+  try {
+    await run("BEGIN");
+    const destinationMax = await get<{ timestamp: string | null }>(
+      "SELECT MAX(timestamp) as timestamp FROM ticket_timeline WHERE ticket_id = ?",
+      [destinationId],
+    );
+    const baseMs = parseDateToMs(destinationMax?.timestamp) + 1000;
+    const sourceTimeline = await query<{ id: number }>(
+      "SELECT id FROM ticket_timeline WHERE ticket_id = ? ORDER BY timestamp ASC, id ASC",
+      [sourceId],
+    );
+
+    for (let i = 0; i < sourceTimeline.length; i++) {
+      const row = sourceTimeline[i];
+      const timestamp = new Date(baseMs + i * 1000).toISOString();
+      await run("UPDATE ticket_timeline SET ticket_id = ?, timestamp = ? WHERE id = ?", [destinationId, timestamp, row.id]);
+    }
+
+    await run(
+      "INSERT INTO ticket_timeline (ticket_id, type, message_body, timestamp) VALUES (?, 'system_activity', ?, ?)",
+      [destinationId, `Merged ticket #${sourceId} (${source.title}) into this ticket.`, isoNow()],
+    );
+    await run(
+      "INSERT INTO ticket_timeline (ticket_id, type, message_body, timestamp) VALUES (?, 'system_activity', ?, ?)",
+      [sourceId, `Ticket merged into #${destinationId} (${destination.title}).`, isoNow()],
+    );
+
+    await run("UPDATE expenses SET work_order_id = ?, updated_at = datetime('now') WHERE work_order_id = ?", [destinationId, sourceId]);
+    await run("DELETE FROM work_orders WHERE id = ?", [sourceId]);
+    await run("COMMIT");
+  } catch {
+    await run("ROLLBACK").catch(() => null);
+    return c.json({ error: "Unable to merge tickets" }, 500);
+  }
+
+  const row = await get(`${WO_SELECT} WHERE w.id = ?`, [destinationId]);
+  return c.json({ work_order: row, merged_from: sourceId, merged_into: destinationId });
+});
+
 app.put("/api/work-orders/:id", async (c) => {
   const id = intParam(c.req.param("id"));
   if (!id) return c.json({ error: "Invalid ID" }, 400);
@@ -739,6 +927,164 @@ app.delete("/api/work-orders/:id", async (c) => {
   const r = await run("DELETE FROM work_orders WHERE id = ?", [id]);
   if (!r.changes) return c.json({ error: "Not found" }, 404);
   return c.json({ ok: true });
+});
+
+app.get("/api/work-orders/:id/timeline", async (c) => {
+  const ticketId = intParam(c.req.param("id"));
+  if (!ticketId) return c.json({ error: "Invalid ID" }, 400);
+  const timeline = await query(
+    `SELECT tt.*,
+      ct.name as sender_name,
+      ct.email_address as sender_email_address,
+      ct.company_name as sender_company_name
+     FROM ticket_timeline tt
+     LEFT JOIN contacts ct ON ct.id = tt.sender_contact_id
+     WHERE tt.ticket_id = ?
+     ORDER BY tt.timestamp ASC, tt.id ASC`,
+    [ticketId],
+  ).catch(() => []);
+  return c.json({ timeline });
+});
+
+app.post("/api/work-orders/:id/timeline", async (c) => {
+  const ticketId = intParam(c.req.param("id"));
+  if (!ticketId) return c.json({ error: "Invalid ID" }, 400);
+  const parsed = await parseJson(c, TicketTimelineInput);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const d = parsed.data;
+  const result = await run(
+    "INSERT INTO ticket_timeline (ticket_id, type, sender_contact_id, message_body, timestamp) VALUES (?, ?, ?, ?, ?)",
+    [ticketId, d.type, d.sender_contact_id ?? null, d.message_body, d.timestamp ?? isoNow()],
+  );
+  const row = await get(
+    `SELECT tt.*,
+      ct.name as sender_name,
+      ct.email_address as sender_email_address,
+      ct.company_name as sender_company_name
+     FROM ticket_timeline tt
+     LEFT JOIN contacts ct ON ct.id = tt.sender_contact_id
+     WHERE tt.id = ?`,
+    [result.lastInsertRowid],
+  );
+  return c.json({ timeline_item: row }, 201);
+});
+
+app.get("/api/work-orders/:id/expenses", async (c) => {
+  const ticketId = intParam(c.req.param("id"));
+  if (!ticketId) return c.json({ error: "Invalid ID" }, 400);
+  const expenses = await query("SELECT * FROM expenses WHERE work_order_id = ? ORDER BY COALESCE(date_paid, created_at) DESC, id DESC", [ticketId]).catch(() => []);
+  return c.json({ expenses });
+});
+
+app.post("/api/work-orders/:id/expenses", async (c) => {
+  const ticketId = intParam(c.req.param("id"));
+  if (!ticketId) return c.json({ error: "Invalid ID" }, 400);
+  const parsed = await parseJson(c, ExpenseInput);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const d = parsed.data;
+  const result = await run(
+    `INSERT INTO expenses (property_id, work_order_id, amount_owed, amount_paid, date_paid, payment_source, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+    [d.property_id, ticketId, d.amount_owed, d.amount_paid ?? 0, d.date_paid ?? null, d.payment_source ?? null],
+  );
+  const row = await get("SELECT * FROM expenses WHERE id = ?", [result.lastInsertRowid]);
+  return c.json({ expense: row }, 201);
+});
+
+app.put("/api/expenses/:id", async (c) => {
+  const expenseId = intParam(c.req.param("id"));
+  if (!expenseId) return c.json({ error: "Invalid ID" }, 400);
+  const parsed = await parseJson(c, ExpenseInput.partial());
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const { sets, params } = buildUpdate(parsed.data);
+  if (!sets.length) return c.json({ error: "No fields" }, 400);
+  sets.push("updated_at = datetime('now')");
+  params.push(expenseId);
+  const result = await run(`UPDATE expenses SET ${sets.join(", ")} WHERE id = ?`, params);
+  if (!result.changes) return c.json({ error: "Not found" }, 404);
+  const row = await get("SELECT * FROM expenses WHERE id = ?", [expenseId]);
+  return c.json({ expense: row });
+});
+
+app.delete("/api/expenses/:id", async (c) => {
+  const expenseId = intParam(c.req.param("id"));
+  if (!expenseId) return c.json({ error: "Invalid ID" }, 400);
+  const result = await run("DELETE FROM expenses WHERE id = ?", [expenseId]);
+  if (!result.changes) return c.json({ error: "Not found" }, 404);
+  return c.json({ ok: true });
+});
+
+app.get("/api/expenses/summary", async (c) => {
+  const summary = await get<{ owner_capital_injected: number; total_amount_owed: number; total_amount_paid: number }>(
+    `SELECT
+      COALESCE(SUM(CASE WHEN payment_source = 'Owner Contribution' THEN amount_paid ELSE 0 END), 0) as owner_capital_injected,
+      COALESCE(SUM(amount_owed), 0) as total_amount_owed,
+      COALESCE(SUM(amount_paid), 0) as total_amount_paid
+     FROM expenses`,
+  );
+  return c.json({
+    owner_capital_injected: summary?.owner_capital_injected ?? 0,
+    total_amount_owed: summary?.total_amount_owed ?? 0,
+    total_amount_paid: summary?.total_amount_paid ?? 0,
+  });
+});
+
+app.post("/api/emails/ingest", async (c) => {
+  const parsed = await parseJson(c, EmailIngestInput);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const senderEmail = (parsed.data.sender_email ?? parsed.data.from_email ?? "").trim().toLowerCase();
+  const senderName = (parsed.data.sender_name ?? parsed.data.from_name ?? "").trim() || null;
+  const subject = (parsed.data.subject ?? "").trim();
+  const bodyText = (parsed.data.body_text ?? parsed.data.body ?? "").trim();
+  const companyName = c.env.AI_COMPANY_NAME ?? null;
+
+  let contact = await get<{ id: number; email_address: string }>("SELECT id, email_address FROM contacts WHERE lower(email_address) = lower(?)", [senderEmail]);
+  if (!contact) {
+    const created = await run(
+      "INSERT INTO contacts (name, email_address, company_name) VALUES (?, ?, ?)",
+      [senderName, senderEmail, companyName],
+    );
+    contact = await get<{ id: number; email_address: string }>("SELECT id, email_address FROM contacts WHERE id = ?", [created.lastInsertRowid]);
+  }
+  if (!contact) return c.json({ error: "Unable to resolve contact" }, 500);
+
+  const activeTickets = await query<{ id: number; title: string; description: string | null; status: string }>(
+    `SELECT id, title, description, status
+     FROM work_orders
+     WHERE status IN (${ACTIVE_WORK_ORDER_STATUSES.map(() => "?").join(", ")})
+     ORDER BY created_at DESC`,
+    [...ACTIVE_WORK_ORDER_STATUSES],
+  ).catch(() => []);
+
+  const decision = await classifyEmailToTicket(c.env.AI, { subject, bodyText, activeTickets });
+  let ticketId = decision.action === "append" ? decision.ticket_id : 0;
+
+  if (decision.action === "create_new") {
+    const newTicket = await run(
+      `INSERT INTO work_orders (title, description, status, priority, notes)
+       VALUES (?, ?, 'pending_owner_decision', 'normal', ?)`,
+      [decision.suggested_title, bodyText.slice(0, 1500) || null, decision.reason],
+    );
+    ticketId = Number(newTicket.lastInsertRowid);
+  }
+
+  await run(
+    "INSERT INTO ticket_timeline (ticket_id, type, sender_contact_id, message_body, timestamp) VALUES (?, 'email', ?, ?, ?)",
+    [ticketId, contact.id, bodyText, isoNow()],
+  );
+  await run(
+    "INSERT INTO ticket_timeline (ticket_id, type, message_body, timestamp) VALUES (?, 'system_activity', ?, ?)",
+    [ticketId, decision.reason, isoNow()],
+  );
+
+  const workOrder = await get(`${WO_SELECT} WHERE w.id = ?`, [ticketId]);
+  return c.json({
+    action: decision.action,
+    ticket_id: ticketId,
+    reason: decision.reason,
+    contact_id: contact.id,
+    work_order: workOrder,
+  });
 });
 
 // ── Applications ───────────────────────────────────────────────────
